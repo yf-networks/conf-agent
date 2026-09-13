@@ -65,6 +65,52 @@ func TestStoreFile2TmpDirWritesVersionMarker(t *testing.T) {
 	}
 }
 
+// CopyFiles entries that are directories must keep their entry name in the
+// versioned config dir (e.g. tls_conf version dir needs client_ca/ and
+// client_crl/ subdirs for BFE to load a self-contained config unit).
+func TestStoreFile2TmpDirCopyFilesKeepDirEntry(t *testing.T) {
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "tls_conf")
+	if err := os.MkdirAll(filepath.Join(confDir, "client_ca"), 0755); err != nil {
+		t.Fatalf("mkdir client_ca fail, err: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(confDir, "client_crl"), 0755); err != nil {
+		t.Fatalf("mkdir client_crl fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "client_ca", "example_ca.crt"), []byte("ca"), 0644); err != nil {
+		t.Fatalf("write ca file fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "tls_rule_conf.data"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write tls rule fail, err: %v", err)
+	}
+
+	fs, err := NewFileStore(confDir, []string{"client_ca", "client_crl", "tls_rule_conf.data"}, 2)
+	if err != nil {
+		t.Fatalf("NewFileStore fail, err: %v", err)
+	}
+
+	version := "20260101120000"
+	if err := fs.StoreFile2TmpDir(context.Background(), version, nil); err != nil {
+		t.Fatalf("StoreFile2TmpDir fail, err: %v", err)
+	}
+
+	versionDir := fs.tmpDir(version)
+	for _, rel := range []string{
+		filepath.Join("client_ca", "example_ca.crt"),
+		filepath.Join("client_crl"),
+		"tls_rule_conf.data",
+	} {
+		if _, err := os.Stat(filepath.Join(versionDir, rel)); err != nil {
+			t.Fatalf("expect %s in version dir, err: %v", rel, err)
+		}
+	}
+
+	// directory contents must not be flattened into the version dir root
+	if _, err := os.Stat(filepath.Join(versionDir, "example_ca.crt")); !os.IsNotExist(err) {
+		t.Fatalf("ca file should not exist at version dir root")
+	}
+}
+
 func TestCleanupOldVersionsKeepRecentN(t *testing.T) {
 	tmpDir := t.TempDir()
 	confDir := filepath.Join(tmpDir, "mod_demo")
@@ -127,10 +173,13 @@ func TestCleanupOldVersionsIgnoreDirsWithoutMarker(t *testing.T) {
 	// directory with marker
 	createVersionDir(t, fs.tmpDir("20260101120001"), "20260101120001")
 
-	// directory without marker
+	// non-empty directory without marker (user-managed, must be left alone)
 	noMarkerDir := fs.tmpDir("20260101120000") + "_manual"
 	if err := os.MkdirAll(noMarkerDir, os.ModePerm); err != nil {
 		t.Fatalf("mkdir fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(noMarkerDir, "manual.txt"), []byte("x"), 0644); err != nil {
+		t.Fatalf("write manual file fail, err: %v", err)
 	}
 
 	if err := fs.cleanupOldVersions(context.Background(), 1); err != nil {
@@ -373,5 +422,211 @@ func TestRenameDirCrossDeviceFallback(t *testing.T) {
 	}
 	if string(content) != "cross-device" {
 		t.Fatalf("expect content 'cross-device', got '%s'", string(content))
+	}
+}
+
+// TestStoreFile2TmpDirMissingCopyFileSkips verifies that a missing CopyFiles
+// source is skipped instead of aborting the store (conf-agent#20: the skip
+// branch used to be dead code because the wrapped not-exist error was not
+// recognized, which permanently stalled the reload loop).
+func TestStoreFile2TmpDirMissingCopyFileSkips(t *testing.T) {
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "mod_demo")
+	if err := os.MkdirAll(confDir, 0755); err != nil {
+		t.Fatalf("mkdir conf dir fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "tls_rule_conf.data"), []byte("{}"), 0644); err != nil {
+		t.Fatalf("write rule file fail, err: %v", err)
+	}
+
+	fs, err := NewFileStore(confDir, []string{"no_such.data", "tls_rule_conf.data"}, 2)
+	if err != nil {
+		t.Fatalf("NewFileStore fail, err: %v", err)
+	}
+
+	files := map[string][]byte{"test.json": []byte(`{"Version":"v1"}`)}
+	if err := fs.StoreFile2TmpDir(context.Background(), "v1", files); err != nil {
+		t.Fatalf("StoreFile2TmpDir should skip missing copy file, err: %v", err)
+	}
+
+	versionDir := fs.tmpDir("v1")
+	if _, err := os.Stat(filepath.Join(versionDir, "tls_rule_conf.data")); err != nil {
+		t.Fatalf("existing copy file should be copied, err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(versionDir, "test.json")); err != nil {
+		t.Fatalf("fetched file should be written, err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(versionDir, versionMarkerFile)); err != nil {
+		t.Fatalf("version marker should be written, err: %v", err)
+	}
+}
+
+// TestStoreFile2TmpDirActiveDirCollision verifies the version-dir name
+// collision guard: when the incoming version equals the active dir name
+// (second-precision version stamps can collide across topics or agent
+// processes), StoreFile2TmpDir must not delete the active dir, must not
+// copy files onto themselves (which would truncate them), and must write
+// the fetched content in place (conf-agent#20).
+func TestStoreFile2TmpDirActiveDirCollision(t *testing.T) {
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "mod_demo")
+	activeDir := fs_tmpDir(confDir, "v1")
+	if err := os.MkdirAll(activeDir, 0755); err != nil {
+		t.Fatalf("mkdir active dir fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(activeDir, "cluster_table.data"), []byte("old content"), 0644); err != nil {
+		t.Fatalf("write cluster table fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(activeDir, "other.data"), []byte("keep me"), 0644); err != nil {
+		t.Fatalf("write other file fail, err: %v", err)
+	}
+	if err := os.Symlink(activeDir, confDir); err != nil {
+		t.Fatalf("symlink conf dir fail, err: %v", err)
+	}
+
+	fs, err := NewFileStore(confDir, []string{"cluster_table.data", "other.data"}, 2)
+	if err != nil {
+		t.Fatalf("NewFileStore fail, err: %v", err)
+	}
+
+	content := []byte(`{"Version":"v1","Config":{}}`)
+	files := map[string][]byte{"cluster_table.data": content}
+	if err := fs.StoreFile2TmpDir(context.Background(), "v1", files); err != nil {
+		t.Fatalf("in-place store should succeed, err: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(activeDir, "cluster_table.data"))
+	if err != nil {
+		t.Fatalf("read cluster table fail, err: %v", err)
+	}
+	if string(got) != string(formatJSONWithIndent(content)) {
+		t.Fatalf("cluster table = %q, want overwritten content %q (self-copy would truncate it)",
+			got, formatJSONWithIndent(content))
+	}
+
+	other, err := os.ReadFile(filepath.Join(activeDir, "other.data"))
+	if err != nil {
+		t.Fatalf("read other file fail, err: %v", err)
+	}
+	if string(other) != "keep me" {
+		t.Fatalf("unrelated file = %q, want %q", other, "keep me")
+	}
+}
+
+func fs_tmpDir(confDir, version string) string {
+	return confDir + "_" + version
+}
+
+// TestStoreFile2TmpDirCleansHalfDoneDir verifies that a failed store removes
+// its half-written version dir so unmarked dirs do not pile up
+// (conf-agent#20).
+func TestStoreFile2TmpDirCleansHalfDoneDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "mod_demo")
+	// a directory entry in CopyFiles lands in the version dir as a directory
+	if err := os.MkdirAll(filepath.Join(confDir, "conflict"), 0755); err != nil {
+		t.Fatalf("mkdir conflict dir fail, err: %v", err)
+	}
+
+	fs, err := NewFileStore(confDir, []string{"conflict"}, 2)
+	if err != nil {
+		t.Fatalf("NewFileStore fail, err: %v", err)
+	}
+
+	// writing a file over the directory copied from CopyFiles must fail
+	files := map[string][]byte{"conflict": []byte(`{"Version":"v1"}`)}
+	if err := fs.StoreFile2TmpDir(context.Background(), "v1", files); err == nil {
+		t.Fatal("StoreFile2TmpDir should fail when target path is a directory")
+	}
+
+	if _, err := os.Stat(fs.tmpDir("v1")); !os.IsNotExist(err) {
+		t.Fatalf("half-done version dir should be cleaned, err: %v", err)
+	}
+}
+
+// TestUpdateDefaultConfDirRejectsDirWithoutMarker verifies that the symlink
+// is never switched to a dir without the version marker (e.g. a
+// half-written one), which would break BFE (conf-agent#20).
+func TestUpdateDefaultConfDirRejectsDirWithoutMarker(t *testing.T) {
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "mod_demo")
+	// version dir exists but has no marker
+	if err := os.MkdirAll(fs_tmpDir(confDir, "v1"), 0755); err != nil {
+		t.Fatalf("mkdir version dir fail, err: %v", err)
+	}
+
+	fs, err := NewFileStore(confDir, nil, 2)
+	if err != nil {
+		t.Fatalf("NewFileStore fail, err: %v", err)
+	}
+
+	if err := fs.UpdateDefaultConfDir(context.Background(), "v1"); err == nil {
+		t.Fatal("UpdateDefaultConfDir should reject dir without version marker")
+	}
+	if _, err := os.Lstat(confDir); !os.IsNotExist(err) {
+		t.Fatalf("conf dir link should not be created, err: %v", err)
+	}
+}
+
+// TestCleanupOldVersionsRemovesEmptyUnmarkedDirs verifies the best-effort
+// sweep of stale empty dirs without a version marker (half-written dirs from
+// interrupted stores), while non-empty unmarked dirs and marked dirs are
+// left alone (conf-agent#20).
+func TestCleanupOldVersionsRemovesEmptyUnmarkedDirs(t *testing.T) {
+	tmpDir := t.TempDir()
+	confDir := filepath.Join(tmpDir, "mod_demo")
+
+	activeDir := fs_tmpDir(confDir, "v3")
+	if err := os.MkdirAll(activeDir, 0755); err != nil {
+		t.Fatalf("mkdir active dir fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(activeDir, versionMarkerFile), []byte("v3"), 0644); err != nil {
+		t.Fatalf("write marker fail, err: %v", err)
+	}
+	if err := os.Symlink(activeDir, confDir); err != nil {
+		t.Fatalf("symlink conf dir fail, err: %v", err)
+	}
+
+	markedOld := fs_tmpDir(confDir, "v2")
+	if err := os.MkdirAll(markedOld, 0755); err != nil {
+		t.Fatalf("mkdir marked old dir fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(markedOld, versionMarkerFile), []byte("v2"), 0644); err != nil {
+		t.Fatalf("write marker fail, err: %v", err)
+	}
+
+	emptyUnmarked := fs_tmpDir(confDir, "v1")
+	if err := os.MkdirAll(emptyUnmarked, 0755); err != nil {
+		t.Fatalf("mkdir empty unmarked dir fail, err: %v", err)
+	}
+
+	nonEmptyUnmarked := fs_tmpDir(confDir, "v0")
+	if err := os.MkdirAll(nonEmptyUnmarked, 0755); err != nil {
+		t.Fatalf("mkdir non-empty unmarked dir fail, err: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmptyUnmarked, "manual.txt"), []byte("x"), 0644); err != nil {
+		t.Fatalf("write manual file fail, err: %v", err)
+	}
+
+	fs, err := NewFileStore(confDir, nil, 2)
+	if err != nil {
+		t.Fatalf("NewFileStore fail, err: %v", err)
+	}
+
+	if err := fs.cleanupOldVersions(context.Background(), 2); err != nil {
+		t.Fatalf("cleanupOldVersions fail, err: %v", err)
+	}
+
+	if _, err := os.Stat(activeDir); err != nil {
+		t.Fatalf("active dir should be kept, err: %v", err)
+	}
+	if _, err := os.Stat(markedOld); err != nil {
+		t.Fatalf("marked old dir should be kept (VersionKeepCount=2), err: %v", err)
+	}
+	if _, err := os.Stat(emptyUnmarked); !os.IsNotExist(err) {
+		t.Fatalf("empty unmarked dir should be removed, err: %v", err)
+	}
+	if _, err := os.Stat(nonEmptyUnmarked); err != nil {
+		t.Fatalf("non-empty unmarked dir should be kept, err: %v", err)
 	}
 }

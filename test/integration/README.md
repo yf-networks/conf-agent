@@ -4,12 +4,13 @@
 
 ## 测试范围
 
-当前覆盖 `file_store` 清理机制相关的集成场景：
+当前覆盖 `file_store` 清理机制与 #20 自愈相关的集成场景：
 
 - 模拟 `ai-gateway-api` InnerAPI 返回配置；
 - 模拟 BFE `/reload/{module}` 热加载接口；
 - 启动真实 `Reloader` 轮询；
-- 验证配置落盘、符号链接切换、版本目录清理是否符合 `VersionKeepCount`。
+- 验证配置落盘、符号链接切换、版本目录清理是否符合 `VersionKeepCount`；
+- 验证激活目录被清空 / CopyFiles 源缺失时 reload 自动恢复（[conf-agent#20](https://github.com/rainway-ai-gateway/conf-agent/issues/20)），空版本目录被兜底清扫。
 
 ## 目录结构
 
@@ -21,9 +22,12 @@ conf-agent/test/integration/
 │   ├── mock_server.go      # mock ai-gateway-api 与 BFE
 │   └── runner.go           # Reloader 启动/停止辅助
 └── tests/
-    └── cleanup/
-        ├── cleanup_test.go # 配置目录清理集成测试
-        └── design.md       # 测试场景与用例说明
+    ├── cleanup/
+    │   ├── cleanup_test.go # 配置目录清理集成测试
+    │   └── design.md       # 测试场景与用例说明
+    └── selfheal/
+        ├── selfheal_test.go # 激活目录清空自愈 / 缺 CopyFiles 自愈 / 空目录清扫（#20）
+        └── design.md        # 测试场景与用例说明
 ```
 
 ## 运行方式

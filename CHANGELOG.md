@@ -10,6 +10,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 
+## [v0.0.7] - 2026-09-13
+
+### Fixed
+- Fix `CopyFiles` directory entries (e.g. `client_ca`/`client_crl` of tls_conf) being flattened into the version directory root, which broke BFE hot reload of the affected module (#19).
+- Fix version-directory name collisions (same-second timestamp or dual-process race) silently dropping config files; the stale directory is now rebuilt in place.
+- Self-heal from store-stage and trigger-stage stalls: validate the `.conf-agent-version` marker before switching the symlink, remove half-finished temp directories on store failure, sweep marker-less empty directories during cleanup, and count consecutive failures across both stages with a summary ERROR every 10 occurrences (#20).
+- Wrap errors with `%w` in `xfile` so the reloader classifies missing-file errors from file_store correctly.
+
+
 ## [v0.0.6] - 2026-08-29
 
 ### Added
@@ -49,6 +58,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - Initial released version
 
+[v0.0.7]: https://github.com/rainway-ai-gateway/conf-agent/compare/v0.0.6...v0.0.7
 [v0.0.6]: https://github.com/bfenetworks/conf-agent/compare/v0.0.5...v0.0.6
 [v0.0.5]: https://github.com/bfenetworks/conf-agent/compare/v0.0.2...v0.0.5
 [v0.0.2]: https://github.com/bfenetworks/conf-agent/compare/v0.0.1...v0.0.2

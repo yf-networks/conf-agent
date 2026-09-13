@@ -43,6 +43,13 @@ func WithVersionKeepCount(count int) ReloaderOption {
 	}
 }
 
+// WithCopyFiles 设置 CopyFiles（从激活目录复制到版本目录的文件/目录列表）
+func WithCopyFiles(copyFiles []string) ReloaderOption {
+	return func(rc *config.ReloaderConfig) {
+		rc.CopyFiles = copyFiles
+	}
+}
+
 // StartReloader 启动一个 Reloader 实例
 func StartReloader(t *testing.T, module, confDir string, confServer, bfeServer *url.URL, opts ...ReloaderOption) *ReloaderRunner {
 	t.Helper()

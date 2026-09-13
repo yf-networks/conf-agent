@@ -15,6 +15,7 @@
 package xfile
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -86,5 +87,28 @@ func TestRenameFileIfNotLinkFile(t *testing.T) {
 			t.Error(err)
 			return
 		}
+	}
+}
+
+// TestIsFileNotExistErrorWrapped verifies that IsFileNotExistError unwraps
+// error chains: FileCopyRecursive wraps stat errors with %w, and the
+// wrapped error must still be recognized (conf-agent#20: with %v wrapping
+// plus os.IsNotExist this returned false and the skip branch was dead code).
+func TestIsFileNotExistErrorWrapped(t *testing.T) {
+	_, err := os.Stat(filepath.Join(t.TempDir(), "no-such-file"))
+	if err == nil {
+		t.Fatal("stat should fail")
+	}
+	if !IsFileNotExistError(err) {
+		t.Fatal("raw not-exist error should be recognized")
+	}
+
+	wrapped := fmt.Errorf("FileCopyRecursive fail, err: %w", err)
+	if !IsFileNotExistError(wrapped) {
+		t.Fatal("wrapped not-exist error should be recognized")
+	}
+
+	if IsFileNotExistError(nil) || IsFileNotExistError(fmt.Errorf("other error")) {
+		t.Fatal("nil and unrelated errors should not be recognized")
 	}
 }

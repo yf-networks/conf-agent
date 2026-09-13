@@ -147,6 +147,40 @@ func (fileStore *FileStore) cleanupOldVersions(ctx context.Context, keep int) er
 		}
 	}
 
+	// Best-effort sweep of stale EMPTY dirs without the version marker.
+	// Half-written dirs from interrupted stores carry no marker and would
+	// otherwise pile up forever (conf-agent#20). Only empty dirs are
+	// removed; non-empty unmarked dirs are left alone (may be user-managed).
+	var staleEmpty []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasPrefix(name, baseName+"_") || strings.HasSuffix(name, ".backup") {
+			continue
+		}
+
+		dirPath := filepath.Join(parentDir, name)
+		if abs, _ := filepath.Abs(dirPath); currentTarget != "" && abs == currentTarget {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dirPath, versionMarkerFile)); err == nil {
+			continue
+		}
+		if sub, err := os.ReadDir(dirPath); err == nil && len(sub) == 0 {
+			staleEmpty = append(staleEmpty, dirPath)
+		}
+	}
+
+	for _, dirPath := range staleEmpty {
+		xlog.Default.Info(xlog.InfoLogFormat(ctx, "cleanupOldVersions.RemoveStaleEmptyDir", dirPath))
+		if err := os.RemoveAll(dirPath); err != nil {
+			removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", dirPath, err))
+		}
+	}
+
 	if len(removeErrs) > 0 {
 		return fmt.Errorf("cleanupOldVersions remove fail: %s", strings.Join(removeErrs, "; "))
 	}
@@ -222,6 +256,15 @@ func (fileStore *FileStore) UpdateDefaultConfDir(ctx context.Context, version st
 		}
 	}
 
+	// Refuse to switch to a directory without the version marker: it is not
+	// a complete conf-agent version dir (e.g. a half-written one), and
+	// pointing ConfDir at it would break BFE.
+	if _, err := os.Stat(filepath.Join(fileStore.tmpDir(version), versionMarkerFile)); err != nil {
+		err = fmt.Errorf("version dir %s has no marker file: %v", fileStore.tmpDir(version), err)
+		xlog.Default.Error(xlog.ErrLogFormat(ctx, "UpdateDefaultConfDir.CheckMarker", err))
+		return err
+	}
+
 	// ln -sf ModDemo_{version} ModDemo
 	// NOTICE: if link fail, bfe can't restart automatically !!!
 	if err := xfile.FileLink(fileStore.tmpDir(version), fileStore.ConfDir); err != nil {
@@ -239,29 +282,68 @@ func (fileStore *FileStore) UpdateDefaultConfDir(ctx context.Context, version st
 
 // StoreFile2TmpDir store all file to tempory directory
 // it will create new file or overwrite old file
-func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string, files map[string][]byte) error {
+func (fileStore *FileStore) StoreFile2TmpDir(ctx context.Context, version string, files map[string][]byte) (retErr error) {
 	tmpDir := fileStore.tmpDir(version)
 
-	// delete tmp directory if exist
-	if err := os.RemoveAll(tmpDir); err != nil && !xfile.IsFileNotExistError(err) {
-		err = fmt.Errorf("RemoveAll fail, dir: %s, err: %v", tmpDir, err)
-		xlog.Default.Error(xlog.ErrLogFormat(ctx, "fileStore.RemoveAll", err))
+	// Never RemoveAll the currently active conf dir. With second-precision
+	// version stamps the incoming version may equal the active dir name
+	// (cross-topic same-second stamps, or a second agent process), and the
+	// active dir may hold the only copy of CopyFiles content.
+	activeTarget, evalErr := filepath.EvalSymlinks(fileStore.ConfDir)
+	absTmp, absErr := filepath.Abs(tmpDir)
+	inPlace := evalErr == nil && absErr == nil && activeTarget == absTmp
+	if inPlace {
+		xlog.Default.Info(xlog.InfoLogFormat(ctx, "fileStore.tmpDirEqualsActiveDir",
+			"tmpDir ", tmpDir, " is the active conf dir, rebuild in place"))
+	} else {
+		// delete tmp directory if exist
+		if err := os.RemoveAll(tmpDir); err != nil && !xfile.IsFileNotExistError(err) {
+			err = fmt.Errorf("RemoveAll fail, dir: %s, err: %v", tmpDir, err)
+			xlog.Default.Error(xlog.ErrLogFormat(ctx, "fileStore.RemoveAll", err))
 
-		return err
+			return err
+		}
+
+		// create tmp directory
+		if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
+			err = fmt.Errorf("MkDirAll fail, dir: %s, err: %v", tmpDir, err)
+			xlog.Default.Error(xlog.ErrLogFormat(ctx, "fileStore.MkdirAll", err))
+
+			return err
+		}
 	}
 
-	// create tmp directory
-	if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
-		err = fmt.Errorf("MkDirAll fail, dir: %s, err: %v", tmpDir, err)
-		xlog.Default.Error(xlog.ErrLogFormat(ctx, "fileStore.MkdirAll", err))
-
-		return err
-	}
+	// Best-effort cleanup of a half-written version dir on failure, so
+	// interrupted stores do not pile up unmarked dirs. The active dir
+	// (inPlace) must never be removed here.
+	defer func() {
+		if retErr != nil && !inPlace {
+			if rmErr := os.RemoveAll(tmpDir); rmErr != nil {
+				xlog.Default.Error(xlog.ErrLogFormat(ctx, "fileStore.RemoveHalfDoneDir",
+					fmt.Errorf("remove half-done dir fail, dir: %s, err: %v", tmpDir, rmErr)))
+			}
+		}
+	}()
 
 	// copy config files (listed in fileStore.CopyFiles) from default dir to tmp dir
 	for _, copyFile := range fileStore.CopyFiles {
 		file := filepath.Join(fileStore.ConfDir, copyFile)
-		if err := xfile.FileCopyRecursive(file, tmpDir); err != nil {
+		// xfile.FileCopyRecursive copies a directory's *contents* into the
+		// destination, so directories must be copied to tmpDir/<name> to keep
+		// their entry name in the versioned config dir.
+		target := tmpDir
+		if info, err := os.Stat(file); err == nil && info.IsDir() {
+			target = filepath.Join(tmpDir, copyFile)
+		}
+		// When rebuilding in place, sources resolve into tmpDir itself;
+		// copying a file onto itself would truncate it.
+		if inPlace {
+			if srcAbs, err := filepath.Abs(filepath.Join(activeTarget, copyFile)); err == nil &&
+				(srcAbs == absTmp || strings.HasPrefix(srcAbs, absTmp+string(filepath.Separator))) {
+				continue
+			}
+		}
+		if err := xfile.FileCopyRecursive(file, target); err != nil {
 			if xfile.IsFileNotExistError(err) {
 				xlog.Default.Info(xlog.ErrLogFormat(ctx, "fileStore.CopyFiles", err))
 				continue

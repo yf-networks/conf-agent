@@ -17,11 +17,14 @@
 | 文档名称 | 相对路径 | 摘要说明 |
 |---------|---------|---------|
 | 配置加载与热加载流程 | [details/配置加载与热加载流程.md](./details/配置加载与热加载流程.md) | 描述 `conf-agent` 从 `ai-gateway-api` 拉取配置、写入临时目录、触发 `BFE` 热加载、切换符号链接的完整流程，以及配置目录版本管理策略。 |
+| 配置目录版本管理与清理 | [details/配置目录版本管理与清理.md](./details/配置目录版本管理与清理.md) | 描述版本目录命名、符号链接切换、`.conf-agent-version` 标识与 `VersionKeepCount` 过期清理策略。 |
+| tls_conf 版本目录下发与自包含性设计 | [details/tls_conf版本目录下发与自包含性设计.md](./details/tls_conf版本目录下发与自包含性设计.md) | 描述 tls_conf 版本目录的内容构成、CopyFiles 复制语义、与 BFE `path` 重定向的自包含性契约，以及热加载失败的死锁风险与可观测性设计。 |
+| 版本目录撞名与 reload 自愈设计 | [details/版本目录撞名与reload自愈设计.md](./details/版本目录撞名与reload自愈设计.md) | 描述版本号构成与撞名路径、撞名保护协议、xfile 错误链契约（`%w` + `errors.Is`）、卡死自愈闭环与防御纵深（conf-agent#20）。 |
 
 ---
 
 ## 三、阅读建议
 
 1. **快速建立全局认知**：先阅读《总体设计文档.md》。
-2. **理解配置加载流程**：阅读《details/配置加载与热加载流程.md》。
+2. **理解配置加载流程**：阅读《details/配置加载与热加载流程.md》；关注 tls_conf 下发时继续阅读《details/tls_conf版本目录下发与自包含性设计.md》。
 3. **查看配置项说明**：参考《../config/config.md》。

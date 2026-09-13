@@ -15,8 +15,10 @@
 package xfile
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -24,12 +26,11 @@ import (
 	"runtime"
 )
 
+// IsFileNotExistError reports whether err indicates a missing file or
+// directory. It unwraps the error chain, so wrapped errors (e.g. from
+// fmt.Errorf("...: %w", err)) are recognized as well.
 func IsFileNotExistError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return os.IsNotExist(err)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 func FileOverwrite(fileName string, content []byte) error {
@@ -50,10 +51,12 @@ func FileOverwrite(fileName string, content []byte) error {
 
 // FileCopyRecursive copies a file or directory recursively from `from` to `to`.
 // When `from` is a file and `to` is a directory, the file is copied into `to`.
+// Errors are wrapped with %w so callers can inspect them with errors.Is
+// (e.g. xfile.IsFileNotExistError).
 func FileCopyRecursive(from, to string) error {
 	fromInfo, err := os.Stat(from)
 	if err != nil {
-		return fmt.Errorf("FileCopyRecursive fail, from: %s, to: %s, err: %v", from, to, err)
+		return fmt.Errorf("FileCopyRecursive fail, from: %s, to: %s, err: %w", from, to, err)
 	}
 
 	if fromInfo.IsDir() {
@@ -66,7 +69,7 @@ func FileCopyRecursive(from, to string) error {
 	if err == nil && toInfo.IsDir() {
 		target = filepath.Join(to, filepath.Base(from))
 	} else if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("FileCopyRecursive fail, from: %s, to: %s, err: %v", from, to, err)
+		return fmt.Errorf("FileCopyRecursive fail, from: %s, to: %s, err: %w", from, to, err)
 	}
 
 	return copyFile(from, target)
@@ -99,6 +102,11 @@ func copyFile(src, dst string) error {
 func copyDir(src, dst string) error {
 	srcInfo, err := os.Stat(src)
 	if err != nil {
+		return err
+	}
+
+	// create dst up front so empty directories are copied too
+	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
 		return err
 	}
 
